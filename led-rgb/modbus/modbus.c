@@ -1,34 +1,54 @@
 #include "modbus.h"
 
 // ------------------------------------------------------------ //
-uint16_t registerMap[MAX_REG + 1];
+// MODBUS address of this device
+uint8_t EEMEM modbusAddress = 0x01;
 
-extern volatile uint8_t modbusAddress;
+// Register map
+volatile uint16_t registerMap[MAX_REGISTERS + 1];
 
-extern volatile uint8_t t0ovf;
-extern volatile uint8_t newFrame;
-extern volatile uint8_t endFrame;
+// Number of timer0 overflows
+volatile uint8_t t0ovf;
 
-extern volatile uint8_t frame[16];
-extern volatile uint8_t frameIndex;
+// Indicates whether the received byte is part of new frame
+volatile uint8_t newFrame;
 
-extern volatile uint8_t flag;
-extern volatile uint8_t rsInFlag;
+// Set on OVF_T15 expire, maximal char space in MODBUS
+volatile uint8_t t15overflowed;
 
-extern void bootload();
+// Frame buffer
+volatile uint8_t frame[16];
+
+// Current frame index
+volatile uint8_t frameIndex;
+
+// Frame OK flag
+volatile uint8_t flag;
+
+// Next finished transfer is going to disable drive
+volatile uint8_t rsDriveDisableFlag = 0;
+
+volatile uint8_t eventCounter = 0;
 
 // ------------------------------------------------------------ //
+/**
+ * Resets MODBUS timer overflow counter, newFrame, endFrame, frameIndex flags
+ * and clears all error.
+ */
 void modbusReset() {
+	MODBUS_TIMER_STOP;
+
 	t0ovf = 0;
 
 	newFrame = 1;
-	endFrame = 0;
+	t15overflowed = 0;
 	frameIndex = 0;
 
 	flag = FLAG_OK;
 }
 
-void modbusTimerInit() {
+// Called from main.c to start the timer for the first time.
+void modbusInit() {
 	modbusReset();
 
 	/* Overflow interrupt enable */
@@ -37,17 +57,26 @@ void modbusTimerInit() {
 	sei();
 }
 
+// Makes 16-bit digit from 2 x 8bit ones
 uint16_t make16Bit(uint8_t hi, uint8_t lo) {
 	return (hi<<8) | lo;
 }
 
+// Goes to bootloader
+void bootload() {
+	cli();
+
+	asm volatile(
+		"clr r30 \n\t"
+		"ldi r31, 0x1C \n\t"
+		"ijmp"
+	);
+}
+
 // ------------------------------------------------------------ //
 void modbusReply(uint8_t len, ...) {
-	if (!frame[0] && !registerMap[LOCKDOWN_REGISTER])
-		return;
-
 	uint8_t reply[16];
-	reply[0] = modbusAddress;
+	reply[0] = eeprom_read_byte(&modbusAddress);
 
 	va_list arg;
 	va_start(arg, len);
@@ -63,88 +92,132 @@ void modbusReply(uint8_t len, ...) {
 	reply[1+len]   = (crc>>8) & 0xFF;
 	reply[1+len+1] =  crc & 0xFF;
 
-	// RS485_OUT();
-
 	for (uint8_t i=0; i<len+3; i++)
 		uartSend(reply[i]);
 
-	rsInFlag = 1;
-
-	// _delay_ms(1);
-	// RS485_IN();
+	rsDriveDisableFlag = 1;
 }
 
 void modbusReplyError(uint8_t error) {
-	switch (error) {
-		case ILLEGAL_DATA_ADDRESS:
-			/*
-			 * 0x86 - Error code for function 0x06
-			 * 0x02 - Illegal Data Address
-			 *
-			 */
+	modbusReply(2, 0x80 + frame[1], error);
+}
 
-			modbusReply(2, 0x80 + frame[0], 0x02);
-			break;
+void modbusEchoRequest(uint8_t replyByteCount) {
+	for (uint8_t i=0; i<replyByteCount; i++)
+		uartSend(frame[i]);
 
-		case ILLEGAL_DATA_VALUE:
-			/*
-			 * 0x86 - Error code for function 0x06
-			 * 0x03 - Illegal Data Value
-			 *
-			 */
+	// If not sending back the whole frame, recalculate the CRC
+	if (replyByteCount != frameIndex) {
+		uint16_t crc = fastCRC(frame, replyByteCount);
 
-			modbusReply(2, 0x80 + frame[0], 0x03);
-			break;
+		uartSend((crc>>8) & 0xFF);
+		uartSend(crc & 0xFF);
+	}
+
+	rsDriveDisableFlag = 1;
+}
+
+// ------------------------------------------------------------ //
+/**
+ * Handles timer overflows, OVF_T35(3,5 char) is a end-of-frame overflow count,
+ * when exceeded, the frame is being processed. OVF_T15(1,5 char)
+ * is a deadline for last valid character.
+ */
+ISR(TIMER0_OVF_vect) {
+	TCNT0 += TIMER0_START;
+
+	// When OVF_T15 occurred, and it's time for OVF_T35, then, execute.
+	if (t0ovf > OVF_T35 && t15overflowed == 1) {
+
+		// Flag is OK
+		// Received at least 4 bytes (address, function code, 2x CRC)
+		// CRC check turns out positive
+
+		if (flag && frameIndex >= 4 && fastCRC(frame, frameIndex) == 0) {
+
+			// Slave address matches
+			if (frame[0] == eeprom_read_byte(&modbusAddress)) {
+				RS485_OUT();
+				handleFrame();
+			}
+
+			// it's a broadcast address
+			else if (frame[0] == 0) {
+				handleFrame();
+			}
+		}
+
+		// Stop this timer
+		modbusReset();
+	}
+
+	if (t0ovf > OVF_T15 && newFrame == 0) {
+		// If character is received after setting this flag
+		// The frame is FLAG_NOK
+		t15overflowed = 1;
+
+		// Waiting for t3,5 to expire
+	}
+
+	t0ovf++;
+}
+
+// Interrupt called when character is received.
+ISR(USART_RXC_vect) {
+	frame[frameIndex++] = UDR;
+
+	t0ovf = 0;
+
+	// If character is received after setting this flag
+	// frame isn't valid.
+	if (t15overflowed) {
+		flag = FLAG_NOK;
+	}
+
+	// New frame is received, start the timers
+	if (newFrame) {
+		newFrame = 0;
+		MODBUS_TIMER_START;
 	}
 }
 
-void modbusEchoRequest(uint8_t upTo) {
-	if (frame[0]) {
-		for (uint8_t i=0; i<upTo; i++)
-			uartSend(frame[i]);
+// Disables RS485 transmitter when the flag is set
+ISR(USART_TXC_vect) {
+	if (rsDriveDisableFlag) {
+		RS485_IN();
 
-		if (upTo != frameIndex) {
-			uint16_t crc = fastCRC(frame, upTo);
-
-			uartSend((crc>>8) & 0xFF);
-			uartSend(crc & 0xFF);
-		}
-
-		rsInFlag = 1;
+		rsDriveDisableFlag = 0;
 	}
 }
 
 // ------------------------------------------------------------ //
+// Handle different instructions
 void handleFrame() {
-	// uartSend(0xF0 + frame[1]);
-
-	/* Function code */
-	switch (frame[1]) {
-		case 0x05:
-			writeSingleCoil();
-			break;
-
-		case 0x06:
-			writeSingleRegister();
-			break;
-
-		case 0x10:
-			writeMultipleRegisters();
-			break;
-
-		default:
-			// Illegal function (0x01)
-			if (frame[0] && !registerMap[LOCKDOWN_REGISTER])
-				modbusReply(2, frame[1]+0x80, 0x01);
+	if (dimEnabled && frame[1] != GET_COMM_EVENT_COUNTER) {
+		modbusReplyError(SERVER_DEVICE_BUSY);
 	}
-}
 
-void registerMapUpdate(uint8_t registerAddress) {
-	if (registerAddress <= 0x02)
-		updatePWM(registerAddress);
+	else {
+		switch (frame[1]) {
+			case WRITE_SINGLE_COIL:
+				writeSingleCoil();
+				break;
 
-	else if (registerAddress == DIM_REGISTER) {
-		dim(registerMap[DIM_REGISTER]);
+			case WRITE_SINGLE_REGISTER:
+				writeSingleRegister(make16Bit(frame[2], frame[3]), make16Bit(frame[4], frame[5]), 0);
+				break;
+
+			case GET_COMM_EVENT_COUNTER:
+				getCommEventCounter();
+				break;
+
+			case WRITE_MULTIPLE_REGISTERS:
+				writeMultipleRegisters();
+				break;
+
+			default:
+				modbusReplyError(ILLEGAL_FUNCTION);
+		}
 	}
 }
 
@@ -152,154 +225,119 @@ void writeSingleCoil() {
 	uint16_t registerAddress = make16Bit(frame[2], frame[3]);
 	uint16_t registerValue = make16Bit(frame[4], frame[5]);
 
+	if (registerValue == 0xFF00 || registerValue == 0x0000) {
+		// Error occurred
+		uint8_t error = 0;
 
-	if (registerAddress == BOOTLOAD_REGISTER) {
-		if (registerValue == 0xFF00) {
-			bootload();
-		}
-
-		else
-			modbusReplyError(ILLEGAL_DATA_VALUE);
-	}
-
-	if (registerAddress != LOCKDOWN_REGISTER && registerMap[LOCKDOWN_REGISTER]) {
-		RS485_IN();
-		return;
-	}
-
-
-	if (registerAddress == LOCKDOWN_REGISTER) {
-
-		switch (registerValue) {
-			case 0xFF00:
-				registerMap[registerAddress] = 1;
+		switch (registerAddress) {
+			case COIL_LATCH:
+				updatePWM(registerMap[REGISTER_RED], registerMap[REGISTER_GREEN], registerMap[REGISTER_BLUE]);
 				break;
 
-			case 0x0000:
-				registerMap[registerAddress] = 0;
+			case COIL_LOCKDOWN:
+				// lockdown todo
+				break;
+
+			case COIL_BOOTLOAD:
+				if (registerValue == 0xFF00) bootload();
+				else modbusReplyError(ILLEGAL_DATA_VALUE);
+				error = 1;
+
 				break;
 
 			default:
-				modbusReplyError(ILLEGAL_DATA_VALUE);
-				return;
+				modbusReplyError(ILLEGAL_DATA_ADDRESS);
+				error = 1;
 		}
 
-		// registerMapUpdate(registerAddress);
-
-		modbusEchoRequest(frameIndex);
+		if (!error) {
+			modbusEchoRequest(frameIndex);
+			eventCounter++;
+		}
 	}
 
-	else
-		modbusReplyError(ILLEGAL_DATA_ADDRESS);
+	else {
+		modbusReplyError(ILLEGAL_DATA_VALUE);
+	}
 }
 
-void writeSingleRegister() {
-	uint16_t registerAddress = make16Bit(frame[2], frame[3]);
-	uint16_t registerValue = make16Bit(frame[4], frame[5]);
+void writeSingleRegister(uint16_t registerAddress, uint16_t registerValue, uint8_t multiple) {
+	// Error occurred
+	uint8_t error = 0;
 
-	if (registerMap[LOCKDOWN_REGISTER]) {
-		RS485_IN();
-		return;
+	switch (registerAddress) {
+		case REGISTER_RED:
+		case REGISTER_GREEN:
+		case REGISTER_BLUE:
+			registerMap[registerAddress] = registerValue;
+			break;
+
+		case REGISTER_DIM:
+			dim(registerMap[REGISTER_RED], registerMap[REGISTER_GREEN], registerMap[REGISTER_BLUE], registerValue);
+
+			break;
+
+		case REGISTER_ADDRESS:
+			// Check the MODBUS address range
+			if (registerValue < 1 || registerValue > 247) {
+				modbusReplyError(ILLEGAL_DATA_VALUE);
+				error = 1;
+			}
+
+			else
+				eeprom_update_byte(&modbusAddress, registerValue);
+
+			break;
+
+		default:
+			if (!multiple)
+				modbusReplyError(ILLEGAL_DATA_ADDRESS);
+			error = 1;
 	}
 
-	if (registerAddress <= 0x02 || registerAddress == DIM_REGISTER) {
-		registerMap[registerAddress] = registerValue;
+	if (!error && !multiple) {
 
-		if (!(registerValue & 0xFF00) || registerAddress == DIM_REGISTER)
-			registerMapUpdate(registerAddress);
-
-		/*
-		 * All good, echo the request
-		 */
+		// Echo the request
 		modbusEchoRequest(frameIndex);
+		eventCounter++;
 	}
+}
 
-	else
-		modbusReplyError(ILLEGAL_DATA_ADDRESS);
+void getCommEventCounter() {
+	uint8_t status = dimEnabled ? 0xFF : 0x00;
 
-	/*if (registerValue > 255) {
-		modbusReplyError(ILLEGAL_DATA_VALUE);
+	uint8_t cntLo = eventCounter & 0xFF;
+	uint8_t cntHi = (eventCounter >> 8) & 0xFF;
 
-		return;
-	}*/
+	modbusReply(5, GET_COMM_EVENT_COUNTER, status, status, cntHi, cntLo);
 }
 
 void writeMultipleRegisters() {
 	uint16_t startingRegisterAddress = make16Bit(frame[2], frame[3]);
 	uint16_t registerCount = make16Bit(frame[4], frame[5]);
-	uint16_t byteCount = frame[6];
+	uint8_t byteCount = frame[6];
 
-	if (registerMap[LOCKDOWN_REGISTER]) {
-		RS485_IN();
-		return;
-	}
-
-	// 9 = 7 (address + func code + starting x2 + quantity x2 + bytecount) + 2 CRC
+	// Check if frame length matches and byteCount == registerCount*2
+	// 9 means 7 (address + func code + startingRegisterAddress x2 + registerCount x2 + byteCount) + 2 CRC
 	if (byteCount != registerCount*2 || frameIndex != (9 + byteCount)) {
 		modbusReplyError(ILLEGAL_DATA_VALUE);
 
 		return;
 	}
 
-	if (startingRegisterAddress+registerCount > 0x03) {
+	if (startingRegisterAddress+registerCount-1 > MAX_MULTIPLE_REGISTERS) {
 		modbusReplyError(ILLEGAL_DATA_ADDRESS);
 
 		return;
 	}
 
-	uint16_t reg;
-
 	for (int i=0; i<registerCount; i++) {
-		reg = make16Bit(frame[7 + i*2], frame[8 + i*2]);
+		uint16_t registerValue = make16Bit(frame[7 + i*2], frame[8 + i*2]);
 
-		/*if (reg > 255) {
-			modbusReplyError(ILLEGAL_DATA_VALUE);
-
-			return;
-		}*/
-
-		registerMap[startingRegisterAddress + i] = reg & 0xFF;
-
-		if (!(reg & 0xFF00))
-			registerMapUpdate(startingRegisterAddress + i);
+		writeSingleRegister(startingRegisterAddress + i, registerValue, 1);
 	}
 
-	/*
-	 * All good, echo the first 6 bytes of the request
-	 */
-
+	// All good, echo the first 6 bytes of the request
 	modbusEchoRequest(6);
-}
-
-// ------------------------------------------------------------ //
-ISR(TIMER0_OVF_vect) {
-	if (t0ovf > OVF_T35 && endFrame == 1) {
-
-		flag &= (frameIndex >= 4);//	if (flag != FLAG_OK) return;
-		flag &= (fastCRC(frame, frameIndex) == 0);//			if (flag != FLAG_OK) return;
-		flag &= (frame[0] == modbusAddress || frame[0] == 0);//	if (flag != FLAG_OK) return;
-
-		// Process frame
-		if (flag == FLAG_OK) {
-			if (frame[0])
-				RS485_OUT();
-
-			handleFrame();
-		}
-
-		MODBUS_TIMER_STOP;
-		modbusReset();
-	}
-
-	if (t0ovf > OVF_T15 && newFrame == 0) {
-		// If character is received after setting this flag
-		// The frame is FLAG_NOK
-		endFrame = 1;
-
-		// Waiting for t3,5 to expire
-	}
-
-	t0ovf++;
-
-	TCNT0 += TIMER0_START;
+	eventCounter++;
 }

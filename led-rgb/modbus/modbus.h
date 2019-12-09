@@ -2,42 +2,37 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <avr/eeprom.h>
+#include <avr/interrupt.h>
+
+#include "../globaldefs.h"
 
 #include  "../crc/crc.h"
 #include  "../pwm/pwm.h"
-#include  "../led/led.h"
-
-#ifndef UART
-	#include  "../uart/uart.h"
-#endif
+#include  "../uart/uart.h"
 
 // ------------------------------------------------------------ //
-#define MAX_REG				0x0005
-#define LOCKDOWN_REGISTER	0x0003
-#define BOOTLOAD_REGISTER	0x0004
-#define DIM_REGISTER		0x0005
+extern volatile uint8_t dimEnabled;
 
 // ------------------------------------------------------------ //
-
 /* Offset of Timer0 TCNT0 */
-#define TIMER0_START 0
+#define TIMER0_START 96
 
 /* Number of overflows for 1.5 and 3.5 characters
  * See attached timerFreq.ods for details */
-#define OVF_T15 4
-#define OVF_T35 9
+#define OVF_T15 6
+#define OVF_T35 14
 
 // ------------------------------------------------------------ //
 #define MODBUS_TIMER_START TCNT0 = TIMER0_START; TCCR0 = (1<<CS00)
 #define MODBUS_TIMER_STOP  TCCR0 = 0
 
-// ------------------------------------------------------------ //
-#define ILLEGAL_DATA_ADDRESS	0x02
-#define ILLEGAL_DATA_VALUE		0x03
+#define RS485_OUT() PORTD |=  (1<<PD2)
+#define RS485_IN()  PORTD &= ~(1<<PD2)
 
 // ------------------------------------------------------------ //
 void modbusReset();
-void modbusTimerInit();
+void modbusInit();
 
 // ------------------------------------------------------------ //
 void modbusReply(uint8_t len, ...);
@@ -48,9 +43,12 @@ void modbusEchoRequest(uint8_t upTo);
 // ------------------------------------------------------------ //
 void handleFrame();
 
-void writeSingleCoil();			// 0x03
-void writeSingleRegister();		// 0x06
-void writeMultipleRegisters();	// 0x10
+void writeSingleCoil();
+void writeSingleRegister(uint16_t registerAddress, uint16_t registerValue, uint8_t multiple);
+void getCommEventCounter();
+void writeMultipleRegisters();
 
 // ------------------------------------------------------------ //
 ISR(TIMER0_OVF_vect);
+ISR(USART_RXC_vect);
+ISR(USART_TXC_vect);
