@@ -1,5 +1,7 @@
 #define MODBUS
 
+#define MODULE_TYPE 	0x0001
+
 // ------------------------------------------------------------ //
 #define FLAG_OK 1
 #define FLAG_NOK 0
@@ -7,7 +9,7 @@
 // ------------------------------------------------------------ //
 
 // Max directly mapped registers
-#define MAX_REGISTERS			0x0003
+#define MAX_REGISTERS		0x0003
 
 // Max register address to be written by WRITE_MULTIPLE_REGISTERS command
 #define MAX_MULTIPLE_REGISTERS	0x0003
@@ -25,10 +27,16 @@
 #define REGISTER_DIM		0x0003
 
 // Latches (ie. updates the PWM values) the color registers
-#define COIL_LATCH			0x1004
+#define COIL_LATCH			0x1000
 
 // Stores current MODBUS address saved in EEPROM
 #define REGISTER_ADDRESS	0xFFD0
+
+// Stores Module ID for auto ModType guess
+#define REGISTER_ADDRESS_RESET 0xFFD1
+
+// Stores Module ID for auto ModType guess
+#define REGISTER_MODULE_TYPE 0xFFD2
 
 // If set to on, the system doesn't respond to comms
 #define COIL_LOCKDOWN		0xFFE0
@@ -37,6 +45,7 @@
 #define COIL_BOOTLOAD		0xFFF0
 
 // ------------------------------------------------------------ //
+#define READ_HOLDING_REGISTERS		0x03
 #define WRITE_SINGLE_COIL			0x05
 #define WRITE_SINGLE_REGISTER		0x06
 #define GET_COMM_EVENT_COUNTER		0x0B

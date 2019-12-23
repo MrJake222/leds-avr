@@ -49,6 +49,13 @@ void modbusReset() {
 
 // Called from main.c to start the timer for the first time.
 void modbusInit() {
+	uint8_t address = eeprom_read_byte(&modbusAddress);
+
+	// Unprogrammed EEPROM
+	if (address == 0xFF)
+		// Address defaults to 0x01
+		eeprom_write_byte(&modbusAddress, 0x01);
+
 	modbusReset();
 
 	/* Overflow interrupt enable */
@@ -199,6 +206,10 @@ void handleFrame() {
 
 	else {
 		switch (frame[1]) {
+			case READ_HOLDING_REGISTERS:
+				readHoldingRegisters();
+				break;
+
 			case WRITE_SINGLE_COIL:
 				writeSingleCoil();
 				break;
@@ -218,6 +229,82 @@ void handleFrame() {
 			default:
 				modbusReplyError(ILLEGAL_FUNCTION);
 		}
+	}
+}
+
+/**
+ * This command is capable of reading only color registers,
+ * address register and Module's type.
+ */
+void readHoldingRegisters() {
+	uint16_t startingRegisterAddress = make16Bit(frame[2], frame[3]);
+	uint16_t registerCount = make16Bit(frame[4], frame[5]);
+	uint16_t endingRegister = startingRegisterAddress + registerCount - 1;
+
+	if (registerCount == 0) {
+		modbusReplyError(ILLEGAL_DATA_VALUE);
+		return;
+	}
+
+	// max 3 color registers
+	// or 1 address register
+	// or 1 module type register
+	#define MAX_VALUES 3
+
+	uint16_t values[MAX_VALUES];
+	uint8_t count = 0;
+	uint8_t error = 0;
+
+	for (uint16_t currentRegister = startingRegisterAddress; currentRegister <= endingRegister; currentRegister++) {
+		switch (currentRegister) {
+			case REGISTER_RED:
+			case REGISTER_GREEN:
+			case REGISTER_BLUE:
+				values[count++] = registerMap[currentRegister];
+				break;
+
+			case REGISTER_ADDRESS:
+				values[count++] = eeprom_read_byte(&modbusAddress);
+				break;
+
+			case REGISTER_MODULE_TYPE:
+				values[count++] = MODULE_TYPE;
+				break;
+
+			default:
+				modbusReplyError(ILLEGAL_DATA_ADDRESS);
+				error = 1;
+				break;
+		}
+	}
+
+	if (!error) {
+		// Device address
+		// Function code
+		// Byte count
+		// Register values*2 (register values are 16-bit)
+		// 16-bit CRC
+		uint8_t len = 3 + count*2;
+		uint8_t response[3 + MAX_VALUES*2 + 2];
+
+		response[0] = frame[0];
+		response[1] = READ_HOLDING_REGISTERS;
+		response[2] = count*2;
+
+		for (uint8_t i=0; i<count; i++) {
+			response[i*2 + 3] = (values[i] >> 8) & 0xFF;
+			response[i*2 + 4] = values[i] & 0xFF;
+		}
+
+		uint16_t crc = fastCRC(response, len);
+		response[len] = (crc >> 8) & 0xFF;
+		response[len + 1] = crc & 0xFF;
+
+		for (uint8_t i=0; i<len+2; i++)
+			uartSend(response[i]);
+
+		eventCounter++;
+		rsDriveDisableFlag = 1;
 	}
 }
 

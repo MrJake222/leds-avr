@@ -43,6 +43,7 @@ void modbusEchoRequest(uint8_t upTo);
 // ------------------------------------------------------------ //
 void handleFrame();
 
+void readHoldingRegisters();
 void writeSingleCoil();
 void writeSingleRegister(uint16_t registerAddress, uint16_t registerValue, uint8_t multiple);
 void getCommEventCounter();
