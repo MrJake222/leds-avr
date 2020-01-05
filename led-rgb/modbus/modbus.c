@@ -321,14 +321,15 @@ void writeSingleCoil() {
 				updatePWM(registerMap[REGISTER_RED], registerMap[REGISTER_GREEN], registerMap[REGISTER_BLUE]);
 				break;
 
-			case COIL_LOCKDOWN:
-				// lockdown todo
-				break;
-
 			case COIL_BOOTLOAD:
 				if (registerValue == 0xFF00) bootload();
 				else modbusReplyError(ILLEGAL_DATA_VALUE);
 				error = 1;
+
+				break;
+
+			case COIL_ADDRESS_RESET:
+				eeprom_update_byte(&modbusAddress, 0x01);
 
 				break;
 

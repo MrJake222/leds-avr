@@ -33,13 +33,10 @@
 #define REGISTER_ADDRESS	0xFFD0
 
 // Stores Module ID for auto ModType guess
-#define REGISTER_ADDRESS_RESET 0xFFD1
+#define COIL_ADDRESS_RESET 0xFFD1
 
 // Stores Module ID for auto ModType guess
 #define REGISTER_MODULE_TYPE 0xFFD2
-
-// If set to on, the system doesn't respond to comms
-#define COIL_LOCKDOWN		0xFFE0
 
 // If written to 0xFF00, the device reboots to bootloader
 #define COIL_BOOTLOAD		0xFFF0
